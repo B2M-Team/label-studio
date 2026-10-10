@@ -181,6 +181,13 @@ class TestRemoteUserSignIn(TestCase):
         assert response.status_code == 401
         assert not self.signed_in()
 
+    def test_authorization_header_does_not_end_a_matching_header_session(self):
+        self.whoami('ana.lyst@stc.com.kw')
+
+        self.client.get(WHOAMI, HTTP_AUTHORIZATION='Basic eDp4', **{META: 'ana.lyst@stc.com.kw'})
+
+        assert self.signed_in()
+
     def test_logout_does_not_stick_while_the_proxy_still_vouches(self):
         self.whoami('ana.lyst@stc.com.kw')
 
