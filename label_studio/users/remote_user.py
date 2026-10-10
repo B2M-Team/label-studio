@@ -22,6 +22,15 @@ Rules:
   a member would otherwise keep getting a session (and fall back to the first organization).
   Deactivating the account is the revocation that keeps its annotations.
 
+* Cross-site writes are refused. Label Studio switches CSRF protection off, and a browser sends a
+  ``SameSite=Lax`` cookie on a request from any page of the same *site* (every host under the same
+  registrable domain), so a page on a sibling host could otherwise write as the signed-in person. A
+  state-changing request (not GET/HEAD/OPTIONS/TRACE) without an ``Authorization`` header is answered
+  with 403 unless the browser says it is ``Sec-Fetch-Site: same-origin`` (or ``none``); a browser that
+  does not send that header is judged by its ``Origin`` header against the request host. Requests with
+  neither header (command-line clients) are not browsers riding on someone's cookies and pass. This
+  covers every session on the instance, password sessions included, and runs before any sign-in.
+
 What the deployment must guarantee (this module cannot check any of it):
 
 * Only the proxy can reach Label Studio, and the proxy overwrites any client-supplied copy of the
@@ -35,15 +44,22 @@ What the deployment must guarantee (this module cannot check any of it):
 """
 import logging
 import time
+from urllib.parse import urlsplit
 
 from django.conf import settings
 from django.contrib import auth
 from django.contrib.auth.backends import RemoteUserBackend
 from django.core.exceptions import ImproperlyConfigured
+from django.http import HttpResponseForbidden
 from django.utils.deprecation import MiddlewareMixin
 from users.functions.common import login
 
 logger = logging.getLogger(__name__)
+
+SAFE_METHODS = frozenset({'GET', 'HEAD', 'OPTIONS', 'TRACE'})
+# Sec-Fetch-Site values of a request the person made on this very site: from one of its own pages, or typed
+# into the address bar / a bookmark. 'same-site' (a sibling host) and 'cross-site' are what is refused.
+OWN_FETCH_SITES = frozenset({'same-origin', 'none'})
 
 
 def remote_user_meta_key():
@@ -80,7 +96,7 @@ class AllowlistRemoteUserBackend(RemoteUserBackend):
 
 
 class AllowlistRemoteUserMiddleware(MiddlewareMixin):
-    """Open a session for the allowlisted user named by the proxy header.
+    """Open a session for the allowlisted user named by the proxy header, and refuse cross-site writes.
 
     Must run after ``AuthenticationMiddleware``.
     """
@@ -90,6 +106,16 @@ class AllowlistRemoteUserMiddleware(MiddlewareMixin):
             raise ImproperlyConfigured(
                 'AllowlistRemoteUserMiddleware needs AuthenticationMiddleware before it in MIDDLEWARE.'
             )
+
+        if self._is_cross_site_write(request):
+            logger.warning(
+                'Refused cross-site %s %s (Sec-Fetch-Site=%r, Origin=%r)',
+                request.method,
+                request.path,
+                request.META.get('HTTP_SEC_FETCH_SITE'),
+                request.META.get('HTTP_ORIGIN'),
+            )
+            return HttpResponseForbidden('Cross-site request refused.', content_type='text/plain')
 
         email = (request.META.get(remote_user_meta_key()) or '').strip().lower()
 
@@ -120,6 +146,27 @@ class AllowlistRemoteUserMiddleware(MiddlewareMixin):
             # LS's own login(): also stamps session['last_login'], which the inactivity
             # timeout reads; with auth.login() alone that stamp is missing and the user is logged out again.
             login(request, user)
+
+    @staticmethod
+    def _is_cross_site_write(request):
+        """True for a browser write that did not come from this site's own pages.
+
+        A foreign page cannot add an ``Authorization`` header to a request without a CORS preflight (CORS is off),
+        so token requests are not the cookie-riding kind this is about. ``Sec-Fetch-Site`` cannot be set by page
+        script; an unknown value is refused like a foreign one.
+        """
+        if request.method in SAFE_METHODS or request.META.get('HTTP_AUTHORIZATION'):
+            return False
+
+        fetch_site = (request.META.get('HTTP_SEC_FETCH_SITE') or '').strip().lower()
+        if fetch_site:
+            return fetch_site not in OWN_FETCH_SITES
+
+        origin = request.META.get('HTTP_ORIGIN')
+        if origin is None:
+            return False  # no browser metadata at all: not a browser carrying someone's cookies
+        # 'null' (sandboxed or redirected pages) and anything unparsable have no host and are refused
+        return urlsplit(origin).netloc.lower() != request.get_host().lower()
 
     @staticmethod
     def _same_person(request, email):

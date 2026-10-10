@@ -47,7 +47,24 @@ What the deployment has to guarantee (the module cannot check it):
   password login: the header signs them in before the login form.
 * Serve Label Studio from its own host if other people's apps share the origin: a script on a shared
   origin can call the API and gets the viewer's session without the viewer ever opening Label Studio
-  (CSRF is disabled app-wide in Label Studio).
+  (CSRF is disabled app-wide in Label Studio). The cross-site check below covers the sibling hosts.
+
+## Cross-site writes are refused
+
+Label Studio switches CSRF protection off (`DisableCSRF`), and a browser sends a `SameSite=Lax` session
+cookie on a request from any page of the same *site*, which includes every sibling host under the same
+registrable domain. Without a check, a page on such a host could make a blind write (a simple POST) as
+the signed-in person. The middleware therefore answers 403, before any sign-in, to a state-changing
+request (not GET/HEAD/OPTIONS/TRACE) that has no `Authorization` header unless:
+
+* `Sec-Fetch-Site` is `same-origin` or `none` (a header page script cannot set; `same-site`,
+  `cross-site` and unknown values are refused), or
+* the browser sent no `Sec-Fetch-Site` and `Origin` is the request's own host (`Origin: null` is refused), or
+* neither header is present (a command-line client, not a browser carrying someone's cookies).
+
+It applies to every session on the instance, password sessions included, and only while
+`LABEL_STUDIO_REMOTE_USER_EMAIL_HEADER` is set. Token requests are left alone: a foreign page cannot add
+an `Authorization` header without a CORS preflight, and CORS stays off.
 
 ## Running the tests
 

@@ -229,11 +229,132 @@ class TestRemoteUserSignIn(TestCase):
         assert self.whoami('ana.lyst@stc.com.kw').json()['email'] == self.analyst.email
 
 
+PROJECTS = '/api/projects'
+SEC_FETCH_SITE = 'HTTP_SEC_FETCH_SITE'
+
+
+def password_login(client, user):
+    """Sign in through the login page (LS's own login() stamps session['last_login'], force_login() does not and the
+    inactivity timeout then logs the session out)."""
+    user.set_password(PASSWORD)
+    user.save()
+    response = client.post('/user/login/', {'email': user.email, 'password': PASSWORD})
+    assert response.status_code == 302
+
+
+@override_settings(**_remote_user_settings())
+class TestCrossSiteWrites(TestCase):
+    """Label Studio switches CSRF off, and every host under the gate's registrable domain counts as the same *site*
+    (SameSite=Lax cookies are sent), so a page on a sibling host could otherwise write as the signed-in analyst."""
+
+    def setUp(self):
+        self.organization = OrganizationFactory()
+        self.analyst = UserFactory(email='ana.lyst@stc.com.kw', active_organization=self.organization)
+        self.client = Client()
+
+    def create_project(self, **extra):
+        extra.setdefault(META, 'ana.lyst@stc.com.kw')
+        return self.client.post(PROJECTS, data=json.dumps({'title': 'xsite probe'}), content_type='application/json', **extra)
+
+    def projects(self):
+        from projects.models import Project
+
+        return Project.objects.count()
+
+    def test_same_origin_write_works(self):
+        response = self.create_project(**{SEC_FETCH_SITE: 'same-origin'})
+
+        assert response.status_code == 201, response.content
+        assert self.projects() == 1
+
+    def test_write_from_another_site_or_sibling_host_is_refused(self):
+        for site in ('same-site', 'cross-site', 'Same-Site'):
+            with self.subTest(site=site):
+                response = self.create_project(**{SEC_FETCH_SITE: site})
+
+                assert response.status_code == 403
+                assert self.projects() == 0
+
+    def test_refused_write_opens_no_session(self):
+        self.create_project(**{SEC_FETCH_SITE: 'same-site'})
+
+        assert '_auth_user_id' not in self.client.session
+
+    def test_refused_write_is_refused_for_a_running_header_session_too(self):
+        self.client.get(WHOAMI, **{META: 'ana.lyst@stc.com.kw'})
+
+        response = self.create_project(**{SEC_FETCH_SITE: 'same-site'})
+
+        assert response.status_code == 403
+        assert self.projects() == 0
+
+    def test_user_initiated_navigation_is_allowed(self):
+        assert self.create_project(**{SEC_FETCH_SITE: 'none'}).status_code == 201
+
+    def test_without_sec_fetch_site_a_foreign_origin_is_refused(self):
+        response = self.create_project(HTTP_ORIGIN='https://commbi.stc.com.kw')
+
+        assert response.status_code == 403
+        assert self.projects() == 0
+
+    def test_without_sec_fetch_site_the_opaque_null_origin_is_refused(self):
+        assert self.create_project(HTTP_ORIGIN='null').status_code == 403
+
+    def test_without_sec_fetch_site_the_own_origin_is_allowed(self):
+        assert self.create_project(HTTP_ORIGIN='http://testserver').status_code == 201
+
+    def test_a_request_that_says_nothing_is_allowed(self):
+        """curl, scripts, old clients: they cannot ride on a victim's cookies, so there is nothing to check."""
+        assert self.create_project().status_code == 201
+
+    def test_sec_fetch_site_wins_over_a_matching_origin(self):
+        response = self.create_project(HTTP_ORIGIN='http://testserver', **{SEC_FETCH_SITE: 'same-site'})
+
+        assert response.status_code == 403
+
+    def test_reads_are_never_refused(self):
+        for site in ('same-site', 'cross-site'):
+            with self.subTest(site=site):
+                response = self.client.get(WHOAMI, **{META: 'ana.lyst@stc.com.kw', SEC_FETCH_SITE: site})
+
+                assert response.status_code == 200
+
+    def test_token_requests_are_not_touched_by_the_check(self):
+        """A foreign page cannot add an Authorization header without a preflight, which CORS refuses."""
+        response = self.create_project(HTTP_AUTHORIZATION='Token not-a-token', **{SEC_FETCH_SITE: 'same-site'})
+
+        assert response.status_code == 401
+        assert self.projects() == 0
+
+    def test_password_sessions_are_covered_too(self):
+        password_login(self.client, self.analyst)
+
+        response = self.client.post(
+            PROJECTS, data=json.dumps({'title': 'xsite probe'}), content_type='application/json', **{SEC_FETCH_SITE: 'same-site'}
+        )
+
+        assert response.status_code == 403
+        assert self.projects() == 0
+
+
 class TestRemoteUserOffByDefault(TestCase):
     def test_not_wired_in_unless_the_setting_is_set(self):
         assert settings.REMOTE_USER_EMAIL_HEADER == ''
         assert 'users.remote_user.AllowlistRemoteUserMiddleware' not in settings.MIDDLEWARE
         assert 'users.remote_user.AllowlistRemoteUserBackend' not in settings.AUTHENTICATION_BACKENDS
+
+    def test_cross_site_writes_are_not_checked_when_off(self):
+        """Unset means upstream behaviour: the check lives in the remote-user middleware only."""
+        organization = OrganizationFactory()
+        user = UserFactory(email='ana.lyst@stc.com.kw', active_organization=organization)
+        client = Client()
+        password_login(client, user)
+
+        response = client.post(
+            PROJECTS, data=json.dumps({'title': 'xsite probe'}), content_type='application/json', **{SEC_FETCH_SITE: 'same-site'}
+        )
+
+        assert response.status_code == 201, response.content
 
     def test_header_does_nothing_when_off(self):
         organization = OrganizationFactory()
