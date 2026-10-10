@@ -140,10 +140,40 @@ class TestRemoteUserSignIn(TestCase):
         stale = self.client.session
         stale['last_login'] = 0  # signed in long ago
         stale.save()
+        # signed-cookie sessions live in the cookie: hand the aged one to the client
+        self.client.cookies[settings.SESSION_COOKIE_NAME] = stale.session_key
 
         # the proxy still vouches for the person: no 401 for the request that finds the limits over
         assert self.whoami('ana.lyst@stc.com.kw').status_code == 200
         assert self.whoami('ana.lyst@stc.com.kw').status_code == 200
+
+    def test_running_session_ends_when_the_member_is_removed(self):
+        self.whoami('ana.lyst@stc.com.kw')
+        self.analyst.om_through.get(organization=self.organization).soft_delete()
+
+        assert self.whoami('ana.lyst@stc.com.kw').status_code == 401
+        assert not self.signed_in()
+
+    def test_running_session_ends_when_the_account_is_deactivated(self):
+        self.whoami('ana.lyst@stc.com.kw')
+        self.analyst.is_active = False
+        self.analyst.save(update_fields=['is_active'])
+
+        assert self.whoami('ana.lyst@stc.com.kw').status_code == 401
+
+    def test_running_session_ends_when_the_email_turns_ambiguous(self):
+        self.whoami('ana.lyst@stc.com.kw')
+        UserFactory(email='ana.lyst@stc.com.kw', active_organization=self.organization)
+
+        assert self.whoami('ana.lyst@stc.com.kw').status_code == 401
+
+    def test_authorization_header_does_not_keep_a_header_session_alive_for_another_person(self):
+        self.whoami('ana.lyst@stc.com.kw')
+
+        # same cookie, but the proxy now names someone else (and a bogus Authorization rides along)
+        self.client.get(WHOAMI, HTTP_AUTHORIZATION='Basic eDp4', **{META: 'other@stc.com.kw'})
+
+        assert not self.signed_in()
 
     def test_request_with_an_authorization_header_gets_no_header_session(self):
         response = self.client.get(WHOAMI, HTTP_AUTHORIZATION='Token not-a-real-token', **{META: 'ana.lyst@stc.com.kw'})

@@ -12,9 +12,10 @@ Rules:
   unknown email gets no session and no account is created, because every Community account is
   an organization admin and could read everyone's data.
 * A password session is never replaced by the header, and a request carrying an ``Authorization``
-  header is left alone. Only a session that was itself opened from the header follows it: it
-  switches when the header names someone else and ends when the header is gone. While the header
-  keeps matching, the proxy's session decides how long the person stays in, not Label Studio's
+  header never opens a new header session. Only a session that was itself opened from the header
+  follows it, and it is re-checked on every request: it ends when the header is gone, names someone
+  else, or the account was deactivated, removed from the organization or became ambiguous. While
+  all of that holds, the proxy's session decides how long the person stays in, not Label Studio's
   session age limits.
 * The account must also be a current member of an organization. Removing a member from the
   organization does not deactivate the account, and an account that is still active but no longer
@@ -90,24 +91,24 @@ class AllowlistRemoteUserMiddleware(MiddlewareMixin):
                 'AllowlistRemoteUserMiddleware needs AuthenticationMiddleware before it in MIDDLEWARE.'
             )
 
-        if request.META.get('HTTP_AUTHORIZATION'):
-            return  # a token (or JWT) request is its own thing: no header session next to it
-
         email = (request.META.get(remote_user_meta_key()) or '').strip().lower()
 
         if request.user.is_authenticated:
             if not self._session_is_from_header(request):
                 return  # password session: the header never replaces it
-            if request.user.email.lower() == email:
-                # The proxy vouches for this person on every request, so its session decides how long they stay in.
-                # Keeping last_login fresh stops the inactivity middleware (it runs after this one) from logging
-                # them out for one request when the Label Studio limits run out.
+            # A running header session is held to the same rules as a new one on every request: the header
+            # must still name this person and the account must still be active, unique and a member. Cookies
+            # cannot be revoked server side, so this is what ends the session of a removed or deactivated user.
+            if email and self._same_person(request, email):
+                # The proxy vouches for this person on every request, so its session decides how long they stay
+                # in. Keeping last_login fresh stops the inactivity middleware (it runs after this one) from
+                # logging them out for one request when the Label Studio limits run out.
                 request.session['last_login'] = time.time()
                 return
-            auth.logout(request)  # the proxy now names someone else, or nobody
+            auth.logout(request)  # the proxy now names someone else or nobody, or the account lost its access
 
-        if not email:
-            return
+        if not email or request.META.get('HTTP_AUTHORIZATION'):
+            return  # (a token or JWT request is its own thing: no new header session next to it)
 
         user = auth.authenticate(request, remote_user=email)
         if user is not None:
@@ -119,6 +120,11 @@ class AllowlistRemoteUserMiddleware(MiddlewareMixin):
             # LS's own login(): also stamps session['last_login'], which the inactivity
             # timeout reads; with auth.login() alone that stamp is missing and the user is logged out again.
             login(request, user)
+
+    @staticmethod
+    def _same_person(request, email):
+        user = AllowlistRemoteUserBackend().authenticate(request, remote_user=email)
+        return user is not None and user.pk == request.user.pk
 
     @staticmethod
     def _session_is_from_header(request):
