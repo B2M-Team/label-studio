@@ -9,7 +9,7 @@ Base: tag `1.23.2` (`df96d79`).
 | File | Change |
 | --- | --- |
 | `label_studio/users/remote_user.py` | New. Sign in from the email header of a trusted authenticating reverse proxy, allowlist only. |
-| `label_studio/core/settings/base.py` | When `LABEL_STUDIO_REMOTE_USER_EMAIL_HEADER` (or `HEARTEX_` / bare `REMOTE_USER_EMAIL_HEADER`) is set, add the middleware and backend above and default `DISABLE_SIGNUP_WITHOUT_LINK` to true. Unset (the default) changes nothing. |
+| `label_studio/core/settings/base.py` | When `LABEL_STUDIO_REMOTE_USER_EMAIL_HEADER` (or `HEARTEX_` / bare `REMOTE_USER_EMAIL_HEADER`) is set, add the middleware and backend above, send `X-Frame-Options: SAMEORIGIN` (Django's `XFrameOptionsMiddleware`) and default `DISABLE_SIGNUP_WITHOUT_LINK` to true. Unset (the default) changes nothing. |
 | `label_studio/users/tests/test_remote_user.py` | New. Tests for the above. |
 | `b2m/` | New. Image build and this file. |
 
@@ -55,16 +55,32 @@ Label Studio switches CSRF protection off (`DisableCSRF`), and a browser sends a
 cookie on a request from any page of the same *site*, which includes every sibling host under the same
 registrable domain. Without a check, a page on such a host could make a blind write (a simple POST) as
 the signed-in person. The middleware therefore answers 403, before any sign-in, to a state-changing
-request (not GET/HEAD/OPTIONS/TRACE) that has no `Authorization` header unless:
+request (not GET/HEAD/OPTIONS/TRACE) unless:
 
 * `Sec-Fetch-Site` is `same-origin` or `none` (a header page script cannot set; `same-site`,
   `cross-site` and unknown values are refused), or
-* the browser sent no `Sec-Fetch-Site` and `Origin` is the request's own host (`Origin: null` is refused), or
-* neither header is present (a command-line client, not a browser carrying someone's cookies).
+* the browser sent no `Sec-Fetch-Site` and `Origin` is the request's own host (scheme is not compared;
+  `Origin: null`, another port and anything unparsable are refused), or
+* neither header is present (a command-line client or a token SDK, not a browser carrying someone's
+  cookies: a conforming browser sends `Origin` on every unsafe request).
 
-It applies to every session on the instance, password sessions included, and only while
-`LABEL_STUDIO_REMOTE_USER_EMAIL_HEADER` is set. Token requests are left alone: a foreign page cannot add
-an `Authorization` header without a CORS preflight, and CORS stays off.
+An `Authorization` header is not an exemption: a browser request that carries one is judged like any
+other, so a proxy or browser that attaches one on its own cannot open a way around the check. The check
+applies to every session on the instance, password sessions included, and only while
+`LABEL_STUDIO_REMOTE_USER_EMAIL_HEADER` is set.
+
+**Framing.** The pod sends no `X-Frame-Options` and its CSP is report-only without `frame-ancestors`, so a
+sibling host could frame Label Studio and steer the visitor's clicks; those requests are same-origin and
+pass the check above. With the header set, `X-Frame-Options: SAMEORIGIN` is sent.
+
+Known limits:
+
+* GET requests are not checked, and two of them write: `GET /api/projects/<id>/next` takes or refreshes a
+  task lock for the person (24 h), and `GET /logout` ends a password session (a header session comes back
+  on the next request). A sibling page can trigger them, for example through an `<img>`.
+* A browser that sends neither `Sec-Fetch-Site` nor `Origin` on an unsafe request is not a conforming one.
+* Cookie tossing: a sibling host can set a `sessionid` or `csrftoken` cookie with `Domain=<parent>`.
+  `SESSION_COOKIE_NAME=__Host-sessionid` (with Secure and Path=/) would close the first; not done.
 
 ## Running the tests
 

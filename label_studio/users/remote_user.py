@@ -25,11 +25,15 @@ Rules:
 * Cross-site writes are refused. Label Studio switches CSRF protection off, and a browser sends a
   ``SameSite=Lax`` cookie on a request from any page of the same *site* (every host under the same
   registrable domain), so a page on a sibling host could otherwise write as the signed-in person. A
-  state-changing request (not GET/HEAD/OPTIONS/TRACE) without an ``Authorization`` header is answered
-  with 403 unless the browser says it is ``Sec-Fetch-Site: same-origin`` (or ``none``); a browser that
-  does not send that header is judged by its ``Origin`` header against the request host. Requests with
-  neither header (command-line clients) are not browsers riding on someone's cookies and pass. This
-  covers every session on the instance, password sessions included, and runs before any sign-in.
+  state-changing request (not GET/HEAD/OPTIONS/TRACE) is answered with 403 unless the browser says it is
+  ``Sec-Fetch-Site: same-origin`` (or ``none``); a browser that does not send that header is judged by
+  its ``Origin`` header against the request host. Requests with neither header (command-line clients,
+  SDKs with a token) are not browsers riding on someone's cookies and pass. An ``Authorization`` header
+  is no exemption: whatever attaches one in front of a browser request, the browser headers still decide.
+  This covers every session on the instance, password sessions included, and runs before any sign-in.
+* The page cannot be framed by another site (``X-Frame-Options: SAMEORIGIN``, wired in the settings).
+  Otherwise a sibling host could frame Label Studio with the person's cookies and steer their clicks,
+  which the browser sends as same-origin requests that the check above lets through.
 
 What the deployment must guarantee (this module cannot check any of it):
 
@@ -151,11 +155,11 @@ class AllowlistRemoteUserMiddleware(MiddlewareMixin):
     def _is_cross_site_write(request):
         """True for a browser write that did not come from this site's own pages.
 
-        A foreign page cannot add an ``Authorization`` header to a request without a CORS preflight (CORS is off),
-        so token requests are not the cookie-riding kind this is about. ``Sec-Fetch-Site`` cannot be set by page
-        script; an unknown value is refused like a foreign one.
+        ``Sec-Fetch-Site`` cannot be set by page script; an unknown value is refused like a foreign one. A request
+        that carries neither it nor ``Origin`` is no browser (a conforming browser sends ``Origin`` on every unsafe
+        request), so token clients and scripts pass without needing an exemption of their own.
         """
-        if request.method in SAFE_METHODS or request.META.get('HTTP_AUTHORIZATION'):
+        if request.method in SAFE_METHODS:
             return False
 
         fetch_site = (request.META.get('HTTP_SEC_FETCH_SITE') or '').strip().lower()
@@ -166,7 +170,10 @@ class AllowlistRemoteUserMiddleware(MiddlewareMixin):
         if origin is None:
             return False  # no browser metadata at all: not a browser carrying someone's cookies
         # 'null' (sandboxed or redirected pages) and anything unparsable have no host and are refused
-        return urlsplit(origin).netloc.lower() != request.get_host().lower()
+        try:
+            return urlsplit(origin).netloc.lower() != request.get_host().lower()
+        except ValueError:
+            return True
 
     @staticmethod
     def _same_person(request, email):

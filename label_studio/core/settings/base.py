@@ -326,6 +326,10 @@ if REMOTE_USER_EMAIL_HEADER:
         'users.remote_user.AllowlistRemoteUserMiddleware',
     )
     AUTHENTICATION_BACKENDS.append('users.remote_user.AllowlistRemoteUserBackend')
+    # and no framing by another site: a framed page would send its own same-origin requests on the person's
+    # clicks, which the cross-site check in that middleware cannot tell from the person's own
+    MIDDLEWARE.append('django.middleware.clickjacking.XFrameOptionsMiddleware')
+    X_FRAME_OPTIONS = 'SAMEORIGIN'
 
 # B2Metric: with the remote-user header on, open sign-up defaults to closed: a self-registered password account
 # is a session the header never replaces, so it would get around the allowlist.

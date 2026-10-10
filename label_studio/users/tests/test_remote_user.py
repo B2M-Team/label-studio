@@ -26,8 +26,10 @@ def _remote_user_settings():
     middleware = list(settings.MIDDLEWARE)
     at = middleware.index('django.contrib.auth.middleware.AuthenticationMiddleware') + 1
     middleware.insert(at, 'users.remote_user.AllowlistRemoteUserMiddleware')
+    middleware.append('django.middleware.clickjacking.XFrameOptionsMiddleware')
     return {
         'MIDDLEWARE': middleware,
+        'X_FRAME_OPTIONS': 'SAMEORIGIN',
         'AUTHENTICATION_BACKENDS': [
             *settings.AUTHENTICATION_BACKENDS,
             'users.remote_user.AllowlistRemoteUserBackend',
@@ -319,12 +321,64 @@ class TestCrossSiteWrites(TestCase):
 
                 assert response.status_code == 200
 
-    def test_token_requests_are_not_touched_by_the_check(self):
-        """A foreign page cannot add an Authorization header without a preflight, which CORS refuses."""
+    def test_a_browser_write_is_refused_even_when_it_carries_an_authorization_header(self):
+        """The header is no way around the check: something in front of the pod (or a browser) may attach one."""
         response = self.create_project(HTTP_AUTHORIZATION='Token not-a-token', **{SEC_FETCH_SITE: 'same-site'})
 
-        assert response.status_code == 401
+        assert response.status_code == 403
         assert self.projects() == 0
+
+    def test_token_clients_that_send_no_browser_headers_are_not_touched(self):
+        wrong = self.create_project(HTTP_AUTHORIZATION='Token not-a-token')
+        assert wrong.status_code == 401  # got past the check, DRF turned the token down
+        assert self.projects() == 0
+
+        self.organization.jwt.legacy_api_tokens_enabled = True  # off by default in 1.23; the STC scripts use these
+        self.organization.jwt.save()
+        right = self.create_project(HTTP_AUTHORIZATION=f'Token {self.analyst.reset_token().key}')
+        assert right.status_code == 201, right.content
+        assert self.projects() == 1
+
+    def test_refusal_says_so(self):
+        response = self.create_project(**{SEC_FETCH_SITE: 'cross-site'})
+
+        assert response.status_code == 403
+        assert response.content == b'Cross-site request refused.'
+
+    def test_a_form_post_from_a_sibling_host_is_refused(self):
+        """The classic blind write: a simple POST from a <form> on another page, no preflight."""
+        response = self.client.post(PROJECTS, {'title': 'xsite probe'}, **{META: 'ana.lyst@stc.com.kw', SEC_FETCH_SITE: 'same-site'})
+
+        assert response.status_code == 403
+        assert self.projects() == 0
+
+    def test_every_unsafe_method_is_covered(self):
+        from projects.models import Project
+
+        project_id = self.create_project(**{SEC_FETCH_SITE: 'same-origin'}).json()['id']
+        url = f'{PROJECTS}/{project_id}'
+        extra = {META: 'ana.lyst@stc.com.kw', SEC_FETCH_SITE: 'same-site'}
+
+        for method in ('patch', 'put', 'delete', 'post'):
+            with self.subTest(method=method):
+                response = getattr(self.client, method)(url, data=json.dumps({'title': 'taken over'}), content_type='application/json', **extra)
+                assert response.status_code == 403
+        assert Project.objects.get(pk=project_id).title == 'xsite probe'
+
+    def test_without_sec_fetch_site_an_origin_with_another_port_is_refused(self):
+        assert self.create_project(HTTP_ORIGIN='http://testserver:8080').status_code == 403
+        assert self.projects() == 0
+
+    def test_without_sec_fetch_site_an_unparsable_origin_is_refused_not_a_server_error(self):
+        assert self.create_project(HTTP_ORIGIN='http://[::1').status_code == 403
+        assert self.projects() == 0
+
+    def test_the_page_cannot_be_framed_by_another_site(self):
+        """A framed Label Studio would send its own same-origin requests on the visitor's clicks."""
+        response = self.client.get(WHOAMI, **{META: 'ana.lyst@stc.com.kw'})
+
+        assert response.status_code == 200
+        assert response['X-Frame-Options'] == 'SAMEORIGIN'
 
     def test_password_sessions_are_covered_too(self):
         password_login(self.client, self.analyst)
@@ -382,7 +436,9 @@ def _settings_with_env(tmp_path, **env):
         'import json; from django.conf import settings as s; '
         'print(json.dumps({"mw": "users.remote_user.AllowlistRemoteUserMiddleware" in s.MIDDLEWARE, '
         '"backend": "users.remote_user.AllowlistRemoteUserBackend" in s.AUTHENTICATION_BACKENDS, '
-        '"header": s.REMOTE_USER_EMAIL_HEADER, "signup_closed": s.DISABLE_SIGNUP_WITHOUT_LINK}))'
+        '"header": s.REMOTE_USER_EMAIL_HEADER, "signup_closed": s.DISABLE_SIGNUP_WITHOUT_LINK, '
+        '"framing_closed": "django.middleware.clickjacking.XFrameOptionsMiddleware" in s.MIDDLEWARE '
+        'and s.X_FRAME_OPTIONS == "SAMEORIGIN"}))'
     )
     child_env = {k: v for k, v in os.environ.items() if not k.startswith(('LABEL_STUDIO_REMOTE_USER', 'LABEL_STUDIO_DISABLE_SIGNUP'))}
     child_env.update(
@@ -398,13 +454,19 @@ def _settings_with_env(tmp_path, **env):
 def test_real_settings_wire_everything_in_and_close_sign_up_when_the_header_is_set(tmp_path):
     loaded = _settings_with_env(tmp_path, LABEL_STUDIO_REMOTE_USER_EMAIL_HEADER='X-Auth-Request-Email')
 
-    assert loaded == {'mw': True, 'backend': True, 'header': 'X-Auth-Request-Email', 'signup_closed': True}
+    assert loaded == {
+        'mw': True,
+        'backend': True,
+        'header': 'X-Auth-Request-Email',
+        'signup_closed': True,
+        'framing_closed': True,
+    }
 
 
 def test_real_settings_leave_sign_up_alone_when_the_header_is_off(tmp_path):
     loaded = _settings_with_env(tmp_path)
 
-    assert loaded == {'mw': False, 'backend': False, 'header': '', 'signup_closed': False}
+    assert loaded == {'mw': False, 'backend': False, 'header': '', 'signup_closed': False, 'framing_closed': False}
 
 
 def test_real_settings_treat_a_blank_header_value_as_off(tmp_path):
