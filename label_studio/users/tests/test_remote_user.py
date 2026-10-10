@@ -2,10 +2,17 @@
 
 Modified by B2Metric (Apache-2.0 section 4(b)): this file is new in the B2Metric fork.
 """
+import json
+import os
+import subprocess
+import sys
+from unittest import mock
+
 import pytest
 from django.conf import settings
 from django.test import Client, TestCase, override_settings
 from organizations.tests.factories import OrganizationFactory
+from users.functions.common import login
 from users.models import User
 from users.tests.factories import UserFactory
 
@@ -41,6 +48,9 @@ class TestRemoteUserSignIn(TestCase):
         extra = {META: email} if email is not None else {}
         return (client or self.client).get(WHOAMI, **extra)
 
+    def signed_in(self):
+        return '_auth_user_id' in self.client.session
+
     def test_allowlisted_email_gets_a_session(self):
         response = self.whoami('ana.lyst@stc.com.kw')
 
@@ -71,6 +81,7 @@ class TestRemoteUserSignIn(TestCase):
         response = self.whoami('stranger@stc.com.kw')
 
         assert response.status_code == 401
+        assert not self.signed_in()
         assert User.objects.count() == before
 
     def test_inactive_account_gets_nothing(self):
@@ -78,11 +89,74 @@ class TestRemoteUserSignIn(TestCase):
         self.analyst.save(update_fields=['is_active'])
 
         assert self.whoami('ana.lyst@stc.com.kw').status_code == 401
+        assert not self.signed_in()
 
     def test_ambiguous_email_is_refused(self):
         UserFactory(email='ana.lyst@stc.com.kw', active_organization=self.organization)
 
         assert self.whoami('ana.lyst@stc.com.kw').status_code == 401
+        assert not self.signed_in()
+
+    def test_removed_member_gets_nothing(self):
+        # soft_delete() is what "Remove member" does: the account stays active, the membership goes
+        self.analyst.om_through.get(organization=self.organization).soft_delete()
+
+        assert self.whoami('ana.lyst@stc.com.kw').status_code == 401
+        assert not self.signed_in()
+
+    def test_deactivated_user_loses_a_running_header_session(self):
+        self.whoami('ana.lyst@stc.com.kw')
+        self.analyst.is_active = False
+        self.analyst.save(update_fields=['is_active'])
+
+        assert self.whoami('ana.lyst@stc.com.kw').status_code == 401
+
+    def test_other_user_signs_in_over_the_stale_session_of_a_deactivated_one(self):
+        self.whoami('ana.lyst@stc.com.kw')
+        self.analyst.is_active = False
+        self.analyst.save(update_fields=['is_active'])
+
+        # same browser, the header now names an active user: signed in and the timeout stamp survives
+        assert self.whoami('other@stc.com.kw').json()['email'] == self.other.email
+        assert 'last_login' in self.client.session
+        assert self.whoami('other@stc.com.kw').json()['email'] == self.other.email
+
+    def test_session_ends_when_the_header_switches_to_an_unknown_email(self):
+        self.whoami('ana.lyst@stc.com.kw')
+
+        assert self.whoami('stranger@stc.com.kw').status_code == 401
+        assert not self.signed_in()
+
+    def test_mixed_case_account_signs_in_once_not_on_every_request(self):
+        with mock.patch('users.remote_user.login', wraps=login) as signed_in:
+            self.whoami('ana.lyst@stc.com.kw')
+            self.whoami('ana.lyst@stc.com.kw')
+            self.whoami('ana.lyst@stc.com.kw')
+
+        assert signed_in.call_count == 1
+
+    def test_session_does_not_bounce_when_the_labelstudio_limits_run_out(self):
+        self.whoami('ana.lyst@stc.com.kw')
+        stale = self.client.session
+        stale['last_login'] = 0  # signed in long ago
+        stale.save()
+
+        # the proxy still vouches for the person: no 401 for the request that finds the limits over
+        assert self.whoami('ana.lyst@stc.com.kw').status_code == 200
+        assert self.whoami('ana.lyst@stc.com.kw').status_code == 200
+
+    def test_request_with_an_authorization_header_gets_no_header_session(self):
+        response = self.client.get(WHOAMI, HTTP_AUTHORIZATION='Token not-a-real-token', **{META: 'ana.lyst@stc.com.kw'})
+
+        assert response.status_code == 401
+        assert not self.signed_in()
+
+    def test_logout_does_not_stick_while_the_proxy_still_vouches(self):
+        self.whoami('ana.lyst@stc.com.kw')
+
+        self.client.get('/logout', **{META: 'ana.lyst@stc.com.kw'})
+
+        assert self.whoami('ana.lyst@stc.com.kw').status_code == 200
 
     def test_blank_header_is_ignored(self):
         assert self.whoami('  ').status_code == 401
@@ -142,3 +216,48 @@ def test_meta_key_for_header_name(header, key):
 
     with override_settings(REMOTE_USER_EMAIL_HEADER=header):
         assert remote_user_meta_key() == key
+
+
+def _settings_with_env(tmp_path, **env):
+    """Load the real settings module in a fresh process: the override_settings above rebuild the wiring by hand."""
+    code = (
+        'import json; from django.conf import settings as s; '
+        'print(json.dumps({"mw": "users.remote_user.AllowlistRemoteUserMiddleware" in s.MIDDLEWARE, '
+        '"backend": "users.remote_user.AllowlistRemoteUserBackend" in s.AUTHENTICATION_BACKENDS, '
+        '"header": s.REMOTE_USER_EMAIL_HEADER, "signup_closed": s.DISABLE_SIGNUP_WITHOUT_LINK}))'
+    )
+    child_env = {k: v for k, v in os.environ.items() if not k.startswith(('LABEL_STUDIO_REMOTE_USER', 'LABEL_STUDIO_DISABLE_SIGNUP'))}
+    child_env.update(
+        DJANGO_SETTINGS_MODULE='core.settings.label_studio', LABEL_STUDIO_BASE_DATA_DIR=str(tmp_path), **env
+    )
+    out = subprocess.run(  # noqa: S603 - fixed argv
+        [sys.executable, '-c', code], cwd=os.path.dirname(settings.BASE_DIR), env=child_env, capture_output=True, text=True
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_real_settings_wire_everything_in_and_close_sign_up_when_the_header_is_set(tmp_path):
+    loaded = _settings_with_env(tmp_path, LABEL_STUDIO_REMOTE_USER_EMAIL_HEADER='X-Auth-Request-Email')
+
+    assert loaded == {'mw': True, 'backend': True, 'header': 'X-Auth-Request-Email', 'signup_closed': True}
+
+
+def test_real_settings_leave_sign_up_alone_when_the_header_is_off(tmp_path):
+    loaded = _settings_with_env(tmp_path)
+
+    assert loaded == {'mw': False, 'backend': False, 'header': '', 'signup_closed': False}
+
+
+def test_real_settings_treat_a_blank_header_value_as_off(tmp_path):
+    loaded = _settings_with_env(tmp_path, LABEL_STUDIO_REMOTE_USER_EMAIL_HEADER='  ')
+
+    assert loaded['mw'] is False and loaded['header'] == ''
+
+
+def test_sign_up_can_still_be_opened_explicitly(tmp_path):
+    loaded = _settings_with_env(
+        tmp_path, LABEL_STUDIO_REMOTE_USER_EMAIL_HEADER='X-Auth-Request-Email', LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK='false'
+    )
+
+    assert loaded['signup_closed'] is False

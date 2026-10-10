@@ -9,7 +9,7 @@ Base: tag `1.23.2` (`df96d79`).
 | File | Change |
 | --- | --- |
 | `label_studio/users/remote_user.py` | New. Sign in from the email header of a trusted authenticating reverse proxy, allowlist only. |
-| `label_studio/core/settings/base.py` | When `LABEL_STUDIO_REMOTE_USER_EMAIL_HEADER` is set, add the middleware and backend above. Unset (the default) changes nothing. |
+| `label_studio/core/settings/base.py` | When `LABEL_STUDIO_REMOTE_USER_EMAIL_HEADER` (or `HEARTEX_` / bare `REMOTE_USER_EMAIL_HEADER`) is set, add the middleware and backend above and default `DISABLE_SIGNUP_WITHOUT_LINK` to true. Unset (the default) changes nothing. |
 | `label_studio/users/tests/test_remote_user.py` | New. Tests for the above. |
 | `b2m/` | New. Image build and this file. |
 
@@ -22,10 +22,32 @@ Community has no SSO. This adds the smallest thing that lets a deployment behind
 * The header must match an existing, active account (case-insensitive). Unknown emails get no
   session and **no account is created**: every Community account is an organization admin, so
   auto-creating everyone the proxy admits would expose all projects and annotations.
-* A password or token session is never replaced by the header. A session opened from the header
-  follows it: another email switches the user, no header ends the session.
-* The deployment must ensure only the proxy can reach the app and that the proxy overwrites a
-  client-supplied copy of the header. Without that, anyone can claim any email.
+* The account must also be a current member of an organization. "Remove member" only soft-deletes the
+  membership and leaves the account active, so an active account is not enough.
+* A password session is never replaced by the header, and a request with an `Authorization` header gets
+  no header session. A session opened from the header follows it: another email switches the user, no
+  header ends the session. While the header keeps matching, the proxy's session decides how long the
+  person stays in (Label Studio's own session age / idle limits are not applied to header sessions).
+* **Revoking access** = deactivate the account (`is_active=False`); its annotations stay. SSO accounts
+  have no password, so there is nothing else to take away. The header session ends on the next request.
+* **Logout does not stick.** While the proxy still vouches for the person, the next request signs them
+  in again.
+
+What the deployment has to guarantee (the module cannot check it):
+
+* Only the proxy can reach the app, and the proxy overwrites a client-supplied copy of the header.
+  Without that, anyone can claim any email. A client header `X_Auth_Request_Email` (underscores) maps
+  to the same WSGI key; ingress-nginx drops such headers by default and Django `runserver` strips
+  them, uwsgi does not.
+* The identity provider issues only verified, unique emails and the proxy refuses the rest.
+* Signing up stays closed (the default with the header set; do not set
+  `LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK=false`) and SSO accounts have no usable password, so nobody
+  can pre-register a password for an address that is allowlisted later.
+* Do not put a maintainer's own proxy-authenticated email on the allowlist if they need the local
+  password login: the header signs them in before the login form.
+* Serve Label Studio from its own host if other people's apps share the origin: a script on a shared
+  origin can call the API and gets the viewer's session without the viewer ever opening Label Studio
+  (CSRF is disabled app-wide in Label Studio).
 
 ## Running the tests
 

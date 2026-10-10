@@ -11,13 +11,29 @@ Rules:
 * Allowlist, not auto-provisioning. The header only matches an existing, active account. An
   unknown email gets no session and no account is created, because every Community account is
   an organization admin and could read everyone's data.
-* A password or token session is never replaced by the header. Only a session that was itself
-  opened from the header follows it: it switches when the header names someone else and ends
-  when the header is gone.
-* The deployment must make sure that only the proxy can reach Label Studio and that the proxy
-  overwrites any client-supplied copy of the header. Otherwise anyone could claim any email.
+* A password session is never replaced by the header, and a request carrying an ``Authorization``
+  header is left alone. Only a session that was itself opened from the header follows it: it
+  switches when the header names someone else and ends when the header is gone. While the header
+  keeps matching, the proxy's session decides how long the person stays in, not Label Studio's
+  session age limits.
+* The account must also be a current member of an organization. Removing a member from the
+  organization does not deactivate the account, and an account that is still active but no longer
+  a member would otherwise keep getting a session (and fall back to the first organization).
+  Deactivating the account is the revocation that keeps its annotations.
+
+What the deployment must guarantee (this module cannot check any of it):
+
+* Only the proxy can reach Label Studio, and the proxy overwrites any client-supplied copy of the
+  header. Otherwise anyone could claim any email. Mind the underscore spelling: a client header
+  ``X_Auth_Request_Email`` lands under the same WSGI key as ``X-Auth-Request-Email``; the proxy has
+  to drop such headers (ingress-nginx does by default) or the server has to (Django ``runserver``
+  does, uwsgi does not).
+* The identity provider hands out only verified, unique emails, and the proxy refuses the rest.
+* Signing up is closed (``LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK``) and SSO accounts carry no
+  usable password, so nobody can pre-register a password for an address that is later allowlisted.
 """
 import logging
+import time
 
 from django.conf import settings
 from django.contrib import auth
@@ -48,11 +64,18 @@ class AllowlistRemoteUserBackend(RemoteUserBackend):
         matches = list(auth.get_user_model()._default_manager.filter(email__iexact=email)[:2])
         if len(matches) != 1:
             if matches:
-                logger.warning('Remote user email matches several accounts, refusing: %s', email)
+                logger.warning(
+                    'Remote user email matches several accounts, refusing (user ids %s)', [u.pk for u in matches]
+                )
             return None
 
         user = matches[0]
-        return user if self.user_can_authenticate(user) else None
+        if not self.user_can_authenticate(user):
+            return None
+        if not user.om_through.filter(deleted_at__isnull=True).exists():
+            logger.info('Remote user %s is no member of any organization, refusing', user.pk)
+            return None
+        return user
 
 
 class AllowlistRemoteUserMiddleware(MiddlewareMixin):
@@ -67,12 +90,19 @@ class AllowlistRemoteUserMiddleware(MiddlewareMixin):
                 'AllowlistRemoteUserMiddleware needs AuthenticationMiddleware before it in MIDDLEWARE.'
             )
 
+        if request.META.get('HTTP_AUTHORIZATION'):
+            return  # a token (or JWT) request is its own thing: no header session next to it
+
         email = (request.META.get(remote_user_meta_key()) or '').strip().lower()
 
         if request.user.is_authenticated:
             if not self._session_is_from_header(request):
-                return  # password or token session: the header never replaces it
+                return  # password session: the header never replaces it
             if request.user.email.lower() == email:
+                # The proxy vouches for this person on every request, so its session decides how long they stay in.
+                # Keeping last_login fresh stops the inactivity middleware (it runs after this one) from logging
+                # them out for one request when the Label Studio limits run out.
+                request.session['last_login'] = time.time()
                 return
             auth.logout(request)  # the proxy now names someone else, or nobody
 
@@ -81,9 +111,13 @@ class AllowlistRemoteUserMiddleware(MiddlewareMixin):
 
         user = auth.authenticate(request, remote_user=email)
         if user is not None:
+            if auth.SESSION_KEY in request.session:
+                # a stale session of a deactivated or different user: login() would flush it and
+                # lose the last_login stamp below, so start clean
+                auth.logout(request)
             request.user = user
             # LS's own login(): also stamps session['last_login'], which the inactivity
-            # timeout reads; auth.login() alone would log the user out on the next request.
+            # timeout reads; with auth.login() alone that stamp is missing and the user is logged out again.
             login(request, user)
 
     @staticmethod

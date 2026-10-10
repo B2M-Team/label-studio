@@ -1,4 +1,7 @@
-"""This file and its contents are licensed under the Apache License 2.0. Please see the included NOTICE for copyright information and LICENSE for a copy of the license."""
+"""This file and its contents are licensed under the Apache License 2.0. Please see the included NOTICE for copyright information and LICENSE for a copy of the license.
+
+Modified by B2Metric (Apache-2.0 section 4(b)): the remote-user and sign-up default blocks marked "B2Metric" below; see b2m/CHANGES.md.
+"""
 
 """
 Django Base settings for Label Studio.
@@ -316,7 +319,7 @@ USE_USERNAME_FOR_LOGIN = False
 
 # B2Metric: sign in from the email header of a trusted authenticating reverse proxy (opt-in, off by
 # default). Matches existing active accounts only, never creates one. See users/remote_user.py.
-REMOTE_USER_EMAIL_HEADER = get_env('REMOTE_USER_EMAIL_HEADER', '')
+REMOTE_USER_EMAIL_HEADER = (get_env('REMOTE_USER_EMAIL_HEADER', '') or '').strip()
 if REMOTE_USER_EMAIL_HEADER:
     MIDDLEWARE.insert(
         MIDDLEWARE.index('django.contrib.auth.middleware.AuthenticationMiddleware') + 1,
@@ -324,7 +327,9 @@ if REMOTE_USER_EMAIL_HEADER:
     )
     AUTHENTICATION_BACKENDS.append('users.remote_user.AllowlistRemoteUserBackend')
 
-DISABLE_SIGNUP_WITHOUT_LINK = get_bool_env('DISABLE_SIGNUP_WITHOUT_LINK', False)
+# B2Metric: with the remote-user header on, open sign-up defaults to closed: a self-registered password account
+# is a session the header never replaces, so it would get around the allowlist.
+DISABLE_SIGNUP_WITHOUT_LINK = get_bool_env('DISABLE_SIGNUP_WITHOUT_LINK', bool(REMOTE_USER_EMAIL_HEADER))
 
 # Creating extra organizations via POST /api/organizations/ is opt-in: most deployments are single-org
 ALLOW_ORGANIZATION_CREATION = get_bool_env('ALLOW_ORGANIZATION_CREATION', False)
