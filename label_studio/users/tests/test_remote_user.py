@@ -1,0 +1,144 @@
+"""This file and its contents are licensed under the Apache License 2.0. Please see the included NOTICE for copyright information and LICENSE for a copy of the license.
+
+Modified by B2Metric (Apache-2.0 section 4(b)): this file is new in the B2Metric fork.
+"""
+import pytest
+from django.conf import settings
+from django.test import Client, TestCase, override_settings
+from organizations.tests.factories import OrganizationFactory
+from users.models import User
+from users.tests.factories import UserFactory
+
+HEADER = 'X-Auth-Request-Email'
+META = 'HTTP_X_AUTH_REQUEST_EMAIL'
+WHOAMI = '/api/current-user/whoami'
+PASSWORD = 'correct-horse-battery'  # noqa: S105 - throwaway test value
+
+
+def _remote_user_settings():
+    middleware = list(settings.MIDDLEWARE)
+    at = middleware.index('django.contrib.auth.middleware.AuthenticationMiddleware') + 1
+    middleware.insert(at, 'users.remote_user.AllowlistRemoteUserMiddleware')
+    return {
+        'MIDDLEWARE': middleware,
+        'AUTHENTICATION_BACKENDS': [
+            *settings.AUTHENTICATION_BACKENDS,
+            'users.remote_user.AllowlistRemoteUserBackend',
+        ],
+        'REMOTE_USER_EMAIL_HEADER': HEADER,
+    }
+
+
+@override_settings(**_remote_user_settings())
+class TestRemoteUserSignIn(TestCase):
+    def setUp(self):
+        self.organization = OrganizationFactory()
+        self.analyst = UserFactory(email='Ana.Lyst@STC.com.kw', active_organization=self.organization)
+        self.other = UserFactory(email='other@stc.com.kw', active_organization=self.organization)
+        self.client = Client()
+
+    def whoami(self, email=None, client=None):
+        extra = {META: email} if email is not None else {}
+        return (client or self.client).get(WHOAMI, **extra)
+
+    def test_allowlisted_email_gets_a_session(self):
+        response = self.whoami('ana.lyst@stc.com.kw')
+
+        assert response.status_code == 200
+        assert response.json()['email'] == self.analyst.email
+
+    def test_session_follows_a_header_that_names_someone_else(self):
+        self.whoami('ana.lyst@stc.com.kw')
+
+        # same browser, header now names someone else: the session follows it
+        response = self.whoami('other@stc.com.kw')
+
+        assert response.json()['email'] == self.other.email
+
+    def test_session_ends_when_the_header_is_gone(self):
+        self.whoami('ana.lyst@stc.com.kw')
+
+        assert self.whoami().status_code == 401
+
+    def test_session_stamps_last_login_for_the_inactivity_timeout(self):
+        self.whoami('ana.lyst@stc.com.kw')
+
+        assert 'last_login' in self.client.session
+
+    def test_unknown_email_gets_nothing_and_creates_nothing(self):
+        before = User.objects.count()
+
+        response = self.whoami('stranger@stc.com.kw')
+
+        assert response.status_code == 401
+        assert User.objects.count() == before
+
+    def test_inactive_account_gets_nothing(self):
+        self.analyst.is_active = False
+        self.analyst.save(update_fields=['is_active'])
+
+        assert self.whoami('ana.lyst@stc.com.kw').status_code == 401
+
+    def test_ambiguous_email_is_refused(self):
+        UserFactory(email='ana.lyst@stc.com.kw', active_organization=self.organization)
+
+        assert self.whoami('ana.lyst@stc.com.kw').status_code == 401
+
+    def test_blank_header_is_ignored(self):
+        assert self.whoami('  ').status_code == 401
+
+    def password_login(self, extra=None):
+        """Sign in through the login page: LS's own login() stamps session['last_login'], client.login() does not."""
+        self.other.set_password(PASSWORD)
+        self.other.save()
+        response = self.client.post('/user/login/', {'email': self.other.email, 'password': PASSWORD}, **(extra or {}))
+        assert response.status_code == 302
+
+    def test_password_session_is_never_replaced_by_the_header(self):
+        self.password_login()
+
+        response = self.whoami('ana.lyst@stc.com.kw')
+
+        assert response.json()['email'] == self.other.email
+
+    def test_password_session_survives_a_missing_header(self):
+        self.password_login()
+
+        assert self.whoami().json()['email'] == self.other.email
+
+    def test_password_login_works_for_a_header_email_that_is_not_allowlisted(self):
+        self.password_login(extra={META: 'maintainer@stc.com.kw'})
+
+        assert self.whoami('maintainer@stc.com.kw').json()['email'] == self.other.email
+
+    def test_allowlisted_header_email_is_signed_in_before_the_login_form(self):
+        """Keep maintainers' own STC emails out of the allowlist, or they cannot reach the local admin login."""
+        self.password_login(extra={META: 'ana.lyst@stc.com.kw'})
+
+        assert self.whoami('ana.lyst@stc.com.kw').json()['email'] == self.analyst.email
+
+
+class TestRemoteUserOffByDefault(TestCase):
+    def test_not_wired_in_unless_the_setting_is_set(self):
+        assert settings.REMOTE_USER_EMAIL_HEADER == ''
+        assert 'users.remote_user.AllowlistRemoteUserMiddleware' not in settings.MIDDLEWARE
+        assert 'users.remote_user.AllowlistRemoteUserBackend' not in settings.AUTHENTICATION_BACKENDS
+
+    def test_header_does_nothing_when_off(self):
+        organization = OrganizationFactory()
+        UserFactory(email='ana.lyst@stc.com.kw', active_organization=organization)
+
+        response = Client().get(WHOAMI, **{META: 'ana.lyst@stc.com.kw'})
+
+        assert response.status_code == 401
+
+
+@pytest.mark.parametrize(
+    'header, key',
+    [('X-Auth-Request-Email', 'HTTP_X_AUTH_REQUEST_EMAIL'), ('x-forwarded-email', 'HTTP_X_FORWARDED_EMAIL')],
+)
+def test_meta_key_for_header_name(header, key):
+    from users.remote_user import remote_user_meta_key
+
+    with override_settings(REMOTE_USER_EMAIL_HEADER=header):
+        assert remote_user_meta_key() == key

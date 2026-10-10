@@ -314,6 +314,16 @@ AUTHENTICATION_BACKENDS = [
 ]
 USE_USERNAME_FOR_LOGIN = False
 
+# B2Metric: sign in from the email header of a trusted authenticating reverse proxy (opt-in, off by
+# default). Matches existing active accounts only, never creates one. See users/remote_user.py.
+REMOTE_USER_EMAIL_HEADER = get_env('REMOTE_USER_EMAIL_HEADER', '')
+if REMOTE_USER_EMAIL_HEADER:
+    MIDDLEWARE.insert(
+        MIDDLEWARE.index('django.contrib.auth.middleware.AuthenticationMiddleware') + 1,
+        'users.remote_user.AllowlistRemoteUserMiddleware',
+    )
+    AUTHENTICATION_BACKENDS.append('users.remote_user.AllowlistRemoteUserBackend')
+
 DISABLE_SIGNUP_WITHOUT_LINK = get_bool_env('DISABLE_SIGNUP_WITHOUT_LINK', False)
 
 # Creating extra organizations via POST /api/organizations/ is opt-in: most deployments are single-org
